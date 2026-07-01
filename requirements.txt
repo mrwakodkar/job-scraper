@@ -1,1 +1,8 @@
-playwright>=1.40.0
+# Job Scraper Dependencies
+# Updated for GitHub Actions Node.js 24 environment
+
+# Web scraping & browser automation
+playwright>=1.50.0
+
+# Optional: Better error handling & logging
+python-dotenv>=1.0.0  # For environment variables (optional)
