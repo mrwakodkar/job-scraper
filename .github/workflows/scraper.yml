@@ -1,0 +1,57 @@
+name: Daily Job Scraper
+
+# Trigger: Every day at 2 PM IST (8:30 AM UTC)
+on:
+  schedule:
+    - cron: '30 8 * * *'  # 8:30 AM UTC = 2 PM IST
+
+  # Also allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout repository
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Setup Python
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # Step 3: Install Python dependencies
+      - name: Install dependencies
+        run: |
+          pip install playwright
+
+      # Step 4: Install Playwright browsers
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+
+      # Step 5: Run scraper
+      - name: Run job scraper
+        run: python scraper_with_selenium.py
+
+      # Step 6: Upload results as artifact (keep for 30 days)
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: job-results-${{ github.run_number }}
+          path: jobs_scraped_*.json
+          retention-days: 30
+
+      # Step 7: Commit results back to repo (optional)
+      - name: Commit and push results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add jobs_scraped_*.json || true
+          git commit -m "Daily job scrape - $(date)" || true
+          git push || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
