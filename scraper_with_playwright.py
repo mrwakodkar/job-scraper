@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Netherlands Job Search — Playwright-based Scraper
-Fast, lightweight, async support
+Netherlands Job Search — Playwright Scraper v2 (Resilient)
+Improved timeouts, better error handling, retry logic
 Runs daily via GitHub Actions at 2 PM IST (8:30 AM UTC)
 
 Author: Minar Mehar
-Created: 2026-06-30
+Created: 2026-07-01
 """
 
 import json
@@ -13,7 +13,7 @@ import logging
 import asyncio
 from datetime import datetime
 from typing import List, Dict
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
 # Setup logging
 logging.basicConfig(
@@ -23,253 +23,298 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# SCRAPER FUNCTIONS (Async with Playwright)
+# RESILIENT SCRAPER FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════════
 
-async def scrape_indeed_nl(page: Page) -> List[Dict]:
-    """Scrape Indeed.nl"""
+async def scrape_indeed_nl(page: Page, retries: int = 2) -> List[Dict]:
+    """Scrape Indeed.nl with retries and longer timeouts"""
     logger.info("Scraping Indeed.nl...")
     jobs = []
-    try:
-        url = "https://nl.indeed.com/jobs?q=risk+analyst&l=Netherlands&start=0"
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await page.wait_for_selector('[data-testid="job-card-container"]', timeout=15000)
-        await page.wait_for_timeout(2000)  # Wait for dynamic content
 
-        # Get all job cards
-        job_cards = await page.query_selector_all('[data-testid="job-card-container"]')
-        logger.info(f"Found {len(job_cards)} job containers on Indeed")
+    for attempt in range(retries):
+        try:
+            url = "https://nl.indeed.com/jobs?q=risk+analyst&l=Netherlands&start=0"
 
-        for job_card in job_cards[:20]:
+            # Load page faster: use domcontentloaded instead of networkidle
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)  # Wait for JS rendering
+
+            # Try to find job cards with generous timeout
             try:
-                # Extract job details
-                title_elem = await job_card.query_selector('h2.jobTitle span')
-                company_elem = await job_card.query_selector('span.companyName')
+                await page.wait_for_selector('[data-testid="job-card-container"]', timeout=20000)
+            except PlaywrightTimeoutError:
+                logger.warning("Indeed job cards not found, trying alternative selector...")
+                # Fallback selector
+                await page.wait_for_selector('div[class*="job"]', timeout=10000)
 
-                title = await title_elem.text_content() if title_elem else None
-                company = await company_elem.text_content() if company_elem else None
+            # Extract jobs via JavaScript (more reliable)
+            job_cards = await page.query_selector_all('[data-testid="job-card-container"]')
 
-                if not title or not company:
+            if not job_cards:
+                # Fallback: try alternative selectors
+                job_cards = await page.query_selector_all('div.jobCard')
+
+            logger.info(f"Found {len(job_cards)} job containers on Indeed")
+
+            for i, job_card in enumerate(job_cards[:25]):
+                try:
+                    # Extract via JavaScript for reliability
+                    job_data = await job_card.evaluate("""
+                        (el) => {
+                            const title = el.querySelector('h2')?.textContent?.trim() || 'N/A';
+                            const company = el.querySelector('[data-testid="company-name"]')?.textContent?.trim() || 'N/A';
+                            const salary = el.querySelector('.salary-snippet')?.textContent?.trim() || 'Not listed';
+                            const link = el.querySelector('a[data-jk]');
+                            const jobId = link?.getAttribute('data-jk') || '';
+                            return { title, company, salary, jobId };
+                        }
+                    """)
+
+                    if job_data['title'] != 'N/A' and job_data['jobId']:
+                        jobs.append({
+                            'title': job_data['title'],
+                            'company': job_data['company'],
+                            'location': "Netherlands",
+                            'salary': job_data['salary'],
+                            'url': f"https://nl.indeed.com/viewjob?jk={job_data['jobId']}",
+                            'source': 'Indeed.nl',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                except Exception as e:
+                    logger.debug(f"Error extracting Indeed job {i}: {str(e)}")
                     continue
 
-                # Try to get salary
-                salary_elem = await job_card.query_selector('div.salary-snippet')
-                salary = await salary_elem.text_content() if salary_elem else "Not listed"
+            logger.info(f"Indeed.nl: Found {len(jobs)} jobs (attempt {attempt + 1})")
+            if jobs:
+                return jobs  # Success, return early
 
-                # Get job URL
-                link_elem = await job_card.query_selector('a[data-jk]')
-                job_id = await link_elem.get_attribute('data-jk') if link_elem else None
-                job_url = f"https://nl.indeed.com/viewjob?jk={job_id}" if job_id else ""
-
-                if title and company and job_url:
-                    jobs.append({
-                        'title': title.strip(),
-                        'company': company.strip(),
-                        'location': "Netherlands",
-                        'salary': salary.strip(),
-                        'url': job_url,
-                        'source': 'Indeed.nl',
-                        'timestamp': datetime.now().isoformat()
-                    })
-            except Exception as e:
-                logger.debug(f"Error parsing Indeed job: {str(e)}")
-                continue
-
-        logger.info(f"Indeed.nl: Found {len(jobs)} jobs")
-    except Exception as e:
-        logger.error(f"Indeed.nl scraping error: {str(e)}")
+        except PlaywrightTimeoutError as e:
+            logger.warning(f"Indeed.nl timeout on attempt {attempt + 1}/{retries}: {str(e)}")
+            await page.wait_for_timeout(2000)
+            continue
+        except Exception as e:
+            logger.error(f"Indeed.nl error on attempt {attempt + 1}/{retries}: {str(e)}")
+            continue
 
     return jobs
 
-async def scrape_iamexpat_nl(page: Page) -> List[Dict]:
-    """Scrape IamExpat.nl (visa-sponsorship focused)"""
+async def scrape_iamexpat_nl(page: Page, retries: int = 2) -> List[Dict]:
+    """Scrape IamExpat.nl with retries"""
     logger.info("Scraping IamExpat.nl...")
     jobs = []
-    try:
-        url = "https://www.iamexpat.nl/jobs?search=risk&country=Netherlands"
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await page.wait_for_selector('div.job-result', timeout=15000)
-        await page.wait_for_timeout(2000)
 
-        job_results = await page.query_selector_all('div.job-result')
-        logger.info(f"Found {len(job_results)} job containers on IamExpat")
+    for attempt in range(retries):
+        try:
+            url = "https://www.iamexpat.nl/jobs?search=risk&country=Netherlands"
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
 
-        for job in job_results[:20]:
-            try:
-                title_elem = await job.query_selector('h3')
-                title = await title_elem.text_content() if title_elem else None
+            # Try multiple selectors
+            selectors = ['div.job-result', 'div[class*="job"]', 'article']
+            job_results = []
 
-                if not title:
+            for selector in selectors:
+                job_results = await page.query_selector_all(selector)
+                if job_results:
+                    logger.info(f"Found {len(job_results)} with selector: {selector}")
+                    break
+
+            if not job_results:
+                await page.wait_for_selector('div.job-result', timeout=20000)
+                job_results = await page.query_selector_all('div.job-result')
+
+            logger.info(f"Found {len(job_results)} job containers on IamExpat")
+
+            for i, job in enumerate(job_results[:25]):
+                try:
+                    job_data = await job.evaluate("""
+                        (el) => {
+                            const title = el.querySelector('h3')?.textContent?.trim() || el.querySelector('h2')?.textContent?.trim() || 'N/A';
+                            const company = el.querySelector('[class*="company"]')?.textContent?.trim() || 'N/A';
+                            const salary = el.querySelector('[class*="salary"]')?.textContent?.trim() || 'Not listed';
+                            const link = el.querySelector('a');
+                            const url = link?.href || '';
+                            return { title, company, salary, url };
+                        }
+                    """)
+
+                    if job_data['title'] != 'N/A' and job_data['url']:
+                        jobs.append({
+                            'title': job_data['title'],
+                            'company': job_data['company'],
+                            'location': "Netherlands",
+                            'salary': job_data['salary'],
+                            'url': job_data['url'],
+                            'source': 'IamExpat.nl',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                except Exception as e:
+                    logger.debug(f"Error extracting IamExpat job {i}: {str(e)}")
                     continue
 
-                # Get company
-                company_elem = await job.query_selector('span.company-name')
-                company = await company_elem.text_content() if company_elem else "Unknown"
+            logger.info(f"IamExpat.nl: Found {len(jobs)} jobs (attempt {attempt + 1})")
+            if jobs:
+                return jobs
 
-                # Get salary
-                salary_elem = await job.query_selector('span.salary')
-                salary = await salary_elem.text_content() if salary_elem else "Not listed"
-
-                # Get URL
-                link_elem = await job.query_selector('a')
-                job_url = await link_elem.get_attribute('href') if link_elem else None
-
-                if not job_url:
-                    continue
-
-                if not job_url.startswith('http'):
-                    job_url = f"https://www.iamexpat.nl{job_url}"
-
-                jobs.append({
-                    'title': title.strip(),
-                    'company': company.strip(),
-                    'location': "Netherlands",
-                    'salary': salary.strip(),
-                    'url': job_url,
-                    'source': 'IamExpat.nl',
-                    'timestamp': datetime.now().isoformat()
-                })
-            except Exception as e:
-                logger.debug(f"Error parsing IamExpat job: {str(e)}")
-                continue
-
-        logger.info(f"IamExpat.nl: Found {len(jobs)} jobs")
-    except Exception as e:
-        logger.error(f"IamExpat.nl scraping error: {str(e)}")
+        except PlaywrightTimeoutError as e:
+            logger.warning(f"IamExpat.nl timeout on attempt {attempt + 1}/{retries}")
+            await page.wait_for_timeout(2000)
+            continue
+        except Exception as e:
+            logger.error(f"IamExpat.nl error on attempt {attempt + 1}/{retries}: {str(e)}")
+            continue
 
     return jobs
 
-async def scrape_undutchables(page: Page) -> List[Dict]:
-    """Scrape Undutchables (internationals-focused)"""
+async def scrape_undutchables(page: Page, retries: int = 2) -> List[Dict]:
+    """Scrape Undutchables with retries"""
     logger.info("Scraping Undutchables...")
     jobs = []
-    try:
-        url = "https://www.undutchables.com/jobs?q=risk&country=Netherlands"
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await page.wait_for_selector('div.job-result', timeout=15000)
-        await page.wait_for_timeout(2000)
 
-        job_results = await page.query_selector_all('div.job-result')
-        logger.info(f"Found {len(job_results)} job containers on Undutchables")
+    for attempt in range(retries):
+        try:
+            url = "https://www.undutchables.com/jobs?q=risk&country=Netherlands"
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
 
-        for job in job_results[:20]:
-            try:
-                title_elem = await job.query_selector('h2')
-                title = await title_elem.text_content() if title_elem else None
+            selectors = ['div.job-result', 'div[class*="job"]', 'article']
+            job_results = []
 
-                if not title:
+            for selector in selectors:
+                job_results = await page.query_selector_all(selector)
+                if job_results:
+                    break
+
+            logger.info(f"Found {len(job_results)} job containers on Undutchables")
+
+            for i, job in enumerate(job_results[:25]):
+                try:
+                    job_data = await job.evaluate("""
+                        (el) => {
+                            const title = el.querySelector('h2')?.textContent?.trim() || el.querySelector('h3')?.textContent?.trim() || 'N/A';
+                            const company = el.querySelector('[class*="company"]')?.textContent?.trim() || 'N/A';
+                            const salary = el.querySelector('[class*="salary"]')?.textContent?.trim() || 'Not listed';
+                            const link = el.querySelector('a');
+                            const url = link?.href || '';
+                            return { title, company, salary, url };
+                        }
+                    """)
+
+                    if job_data['title'] != 'N/A' and job_data['url']:
+                        if not job_data['url'].startswith('http'):
+                            job_data['url'] = f"https://www.undutchables.com{job_data['url']}"
+
+                        jobs.append({
+                            'title': job_data['title'],
+                            'company': job_data['company'],
+                            'location': "Netherlands",
+                            'salary': job_data['salary'],
+                            'url': job_data['url'],
+                            'source': 'Undutchables',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                except Exception as e:
+                    logger.debug(f"Error extracting Undutchables job {i}: {str(e)}")
                     continue
 
-                company_elem = await job.query_selector('span.company')
-                company = await company_elem.text_content() if company_elem else "Unknown"
+            logger.info(f"Undutchables: Found {len(jobs)} jobs (attempt {attempt + 1})")
+            if jobs:
+                return jobs
 
-                salary_elem = await job.query_selector('span.salary')
-                salary = await salary_elem.text_content() if salary_elem else "Not listed"
-
-                link_elem = await job.query_selector('a')
-                job_url = await link_elem.get_attribute('href') if link_elem else None
-
-                if not job_url:
-                    continue
-
-                if not job_url.startswith('http'):
-                    job_url = f"https://www.undutchables.com{job_url}"
-
-                jobs.append({
-                    'title': title.strip(),
-                    'company': company.strip(),
-                    'location': "Netherlands",
-                    'salary': salary.strip(),
-                    'url': job_url,
-                    'source': 'Undutchables',
-                    'timestamp': datetime.now().isoformat()
-                })
-            except Exception as e:
-                logger.debug(f"Error parsing Undutchables job: {str(e)}")
-                continue
-
-        logger.info(f"Undutchables: Found {len(jobs)} jobs")
-    except Exception as e:
-        logger.error(f"Undutchables scraping error: {str(e)}")
+        except PlaywrightTimeoutError as e:
+            logger.warning(f"Undutchables timeout on attempt {attempt + 1}/{retries}")
+            await page.wait_for_timeout(2000)
+            continue
+        except Exception as e:
+            logger.error(f"Undutchables error on attempt {attempt + 1}/{retries}: {str(e)}")
+            continue
 
     return jobs
 
-async def scrape_monsterboard_nl(page: Page) -> List[Dict]:
-    """Scrape Monsterboard.nl"""
+async def scrape_monsterboard_nl(page: Page, retries: int = 2) -> List[Dict]:
+    """Scrape Monsterboard.nl with retries"""
     logger.info("Scraping Monsterboard.nl...")
     jobs = []
-    try:
-        url = "https://www.monsterboard.nl/en/jobs/risk-analyst/in-netherlands"
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await page.wait_for_selector('div.job-listing', timeout=15000)
-        await page.wait_for_timeout(2000)
 
-        job_listings = await page.query_selector_all('div.job-listing')
-        logger.info(f"Found {len(job_listings)} job containers on Monsterboard")
+    for attempt in range(retries):
+        try:
+            url = "https://www.monsterboard.nl/en/jobs/risk-analyst/in-netherlands"
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
 
-        for job in job_listings[:20]:
-            try:
-                title_elem = await job.query_selector('h2')
-                title = await title_elem.text_content() if title_elem else None
+            selectors = ['div.job-listing', 'div[class*="job"]', 'article']
+            job_listings = []
 
-                if not title:
+            for selector in selectors:
+                job_listings = await page.query_selector_all(selector)
+                if job_listings:
+                    break
+
+            logger.info(f"Found {len(job_listings)} job containers on Monsterboard")
+
+            for i, job in enumerate(job_listings[:25]):
+                try:
+                    job_data = await job.evaluate("""
+                        (el) => {
+                            const title = el.querySelector('h2')?.textContent?.trim() || 'N/A';
+                            const company = el.querySelector('[class*="company"]')?.textContent?.trim() || 'N/A';
+                            const salary = el.querySelector('[class*="salary"]')?.textContent?.trim() || 'Not listed';
+                            const link = el.querySelector('a');
+                            const url = link?.href || '';
+                            return { title, company, salary, url };
+                        }
+                    """)
+
+                    if job_data['title'] != 'N/A' and job_data['url']:
+                        jobs.append({
+                            'title': job_data['title'],
+                            'company': job_data['company'],
+                            'location': "Netherlands",
+                            'salary': job_data['salary'],
+                            'url': job_data['url'],
+                            'source': 'Monsterboard.nl',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                except Exception as e:
+                    logger.debug(f"Error extracting Monsterboard job {i}: {str(e)}")
                     continue
 
-                company_elem = await job.query_selector('span.company')
-                company = await company_elem.text_content() if company_elem else "Unknown"
+            logger.info(f"Monsterboard.nl: Found {len(jobs)} jobs (attempt {attempt + 1})")
+            if jobs:
+                return jobs
 
-                salary_elem = await job.query_selector('span.salary')
-                salary = await salary_elem.text_content() if salary_elem else "Not listed"
-
-                link_elem = await job.query_selector('a')
-                job_url = await link_elem.get_attribute('href') if link_elem else None
-
-                if not job_url:
-                    continue
-
-                jobs.append({
-                    'title': title.strip(),
-                    'company': company.strip(),
-                    'location': "Netherlands",
-                    'salary': salary.strip(),
-                    'url': job_url,
-                    'source': 'Monsterboard.nl',
-                    'timestamp': datetime.now().isoformat()
-                })
-            except Exception as e:
-                logger.debug(f"Error parsing Monsterboard job: {str(e)}")
-                continue
-
-        logger.info(f"Monsterboard.nl: Found {len(jobs)} jobs")
-    except Exception as e:
-        logger.error(f"Monsterboard.nl scraping error: {str(e)}")
+        except PlaywrightTimeoutError as e:
+            logger.warning(f"Monsterboard.nl timeout on attempt {attempt + 1}/{retries}")
+            await page.wait_for_timeout(2000)
+            continue
+        except Exception as e:
+            logger.error(f"Monsterboard.nl error on attempt {attempt + 1}/{retries}: {str(e)}")
+            continue
 
     return jobs
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MAIN EXECUTION (Async)
+# MAIN EXECUTION
 # ════════════════════════════════════════════════════════════════════════════════
 
 async def run_all_scrapers() -> List[Dict]:
-    """Run all scrapers concurrently with Playwright"""
+    """Run all scrapers with improved resilience"""
     logger.info("=" * 80)
-    logger.info(f"Job Search Scraper Started: {datetime.now().isoformat()}")
+    logger.info(f"Job Search Scraper v2 Started: {datetime.now().isoformat()}")
     logger.info("=" * 80)
 
     all_jobs = []
 
     async with async_playwright() as p:
-        # Launch browser (headless mode for GitHub Actions)
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         )
         page = await context.new_page()
-        page.set_default_timeout(30000)
-        page.set_default_navigation_timeout(30000)
+        page.set_default_timeout(60000)  # 60 seconds
+        page.set_default_navigation_timeout(60000)
 
         try:
-            # Define scrapers
             scrapers = [
                 ("Indeed.nl", lambda: scrape_indeed_nl(page)),
                 ("IamExpat.nl", lambda: scrape_iamexpat_nl(page)),
@@ -277,14 +322,13 @@ async def run_all_scrapers() -> List[Dict]:
                 ("Monsterboard.nl", lambda: scrape_monsterboard_nl(page)),
             ]
 
-            # Run scrapers sequentially (can be concurrent if needed)
             for name, scraper_func in scrapers:
                 try:
                     jobs = await scraper_func()
                     all_jobs.extend(jobs)
-                    await page.wait_for_timeout(2000)  # 2 second delay between requests
+                    await page.wait_for_timeout(2000)
                 except Exception as e:
-                    logger.error(f"Error running {name}: {str(e)}")
+                    logger.error(f"Fatal error in {name}: {str(e)}")
                     continue
 
             logger.info(f"Total jobs found: {len(all_jobs)}")
@@ -316,7 +360,6 @@ async def run_all_scrapers() -> List[Dict]:
     return all_jobs
 
 if __name__ == '__main__':
-    # Run async main function
     jobs = asyncio.run(run_all_scrapers())
     print(f"\n✓ Scraped {len(jobs)} jobs from 4 portals")
     print(f"  Output: jobs_scraped_*.json")
