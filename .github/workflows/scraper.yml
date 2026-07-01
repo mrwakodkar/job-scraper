@@ -39,7 +39,7 @@ jobs:
 
       # Step 5: Run scraper (1.5 min timeout)
       - name: Run job scraper
-        run: python scraper_with_playwright_v.py
+        run: python scraper_with_playwright.py
         timeout-minutes: 1.5
 
       # Step 6: Upload results as artifact (30-day retention)
