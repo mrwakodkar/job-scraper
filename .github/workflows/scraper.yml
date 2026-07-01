@@ -11,7 +11,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 2  # Total job timeout: 2 minutes
 
     steps:
       # Step 1: Checkout repository (v5 = Node.js 24)
@@ -37,12 +37,12 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      # Step 5: Run scraper (with timeout)
+      # Step 5: Run scraper (1.5 min timeout)
       - name: Run job scraper
-        run: python scraper_with_playwright.py
-        timeout-minutes: 10
+        run: python scraper_with_playwright_v2.py
+        timeout-minutes: 1.5
 
-      # Step 6: Upload results as artifact
+      # Step 6: Upload results as artifact (30-day retention)
       - name: Upload results
         uses: actions/upload-artifact@v5
         if: always()
